@@ -15,10 +15,10 @@ endif()
 find_package(CURL REQUIRED)
 
 # ==================== nlohmann/json 依赖 ====================
-# 自动下载 nlohmann/json 头文件（如果不存在）
+# 头文件已随仓库提供在 include/json.hpp；若缺失则从发布页下载兜底
 set(JSON_HPP_PATH "${CMAKE_SOURCE_DIR}/include/json.hpp")
 if(NOT EXISTS ${JSON_HPP_PATH})
-    message(STATUS "正在下载 nlohmann/json...")
+    message(STATUS "include/json.hpp 不存在，尝试在线下载 nlohmann/json...")
     file(DOWNLOAD
         "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp"
         ${JSON_HPP_PATH}
@@ -27,7 +27,7 @@ if(NOT EXISTS ${JSON_HPP_PATH})
     )
     list(GET DOWNLOAD_STATUS 0 STATUS_CODE)
     if(NOT STATUS_CODE EQUAL 0)
-        message(FATAL_ERROR "无法下载 nlohmann/json，请从 https://github.com/nlohmann/json/releases 手动下载")
+        message(FATAL_ERROR "无法下载 nlohmann/json，请从 https://github.com/nlohmann/json/releases 手动下载到 include/json.hpp")
     endif()
     message(STATUS "nlohmann/json 下载完成")
 endif()
@@ -41,6 +41,7 @@ set(SOURCES
     src/main.cpp
     src/http_client.cpp
     src/es_client.cpp
+    src/migration.cpp
 )
 
 # 可执行文件

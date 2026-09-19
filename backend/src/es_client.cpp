@@ -3,16 +3,36 @@
 #include <iomanip>
 #include <chrono>
 
+#include <curl/curl.h>
+
 namespace es {
+
+namespace {
+// libcurl 全局初始化（多线程环境必需，整个进程一次）
+struct CurlGlobalGuard {
+    CurlGlobalGuard() { curl_global_init(CURL_GLOBAL_ALL); }
+    ~CurlGlobalGuard() { curl_global_cleanup(); }
+};
+const CurlGlobalGuard curlGlobalGuard;
+} // namespace
 
 // ==================== 构造与析构 ====================
 
-ESClient::ESClient(const std::string& host, int port) {
+ESClient::ESClient(const std::string& host, int port)
+    : host_(host), port_(port) {
     std::ostringstream oss;
     oss << "http://" << host << ":" << port;
     baseUrl_ = oss.str();
-    httpClient_.setTimeout(30);
+    httpClient_.setTimeout(120);
     httpClient_.setConnectTimeout(10);
+}
+
+std::unique_ptr<ESClient> ESClient::fork() const {
+    auto cloned = std::make_unique<ESClient>(host_, port_);
+    if (logCallback_) {
+        cloned->setLogCallback(logCallback_);
+    }
+    return cloned;
 }
 
 ESClient::~ESClient() = default;
@@ -253,6 +273,161 @@ BulkResult ESClient::bulkIndex(const std::string& indexName,
     }
     
     return result;
+}
+
+// ==================== 别名与迁移相关操作 ====================
+
+BulkResult ESClient::bulkActions(const std::vector<BulkAction>& actions) {
+    std::ostringstream body;
+    int indexOps = 0;
+
+    for (const auto& action : actions) {
+        if (action.op == "delete") {
+            json meta = {{"delete", {{"_index", action.index}, {"_id", action.id}}}};
+            body << meta.dump() << "\n";
+        } else {
+            json meta = {{"index", {{"_index", action.index}, {"_id", action.id}}}};
+            body << meta.dump() << "\n";
+            body << action.doc.dump() << "\n";
+            ++indexOps;
+        }
+    }
+
+    auto response = httpClient_.post(buildUrl("/_bulk"), body.str());
+
+    BulkResult result;
+    if (!response.isSuccess()) {
+        throw ESException("Bulk action failed: " + response.body);
+    }
+
+    auto respJson = json::parse(response.body);
+    result.took = respJson.value("took", 0);
+    result.errors = respJson.value("errors", false);
+    result.successCount = 0;
+    result.failCount = 0;
+
+    for (const auto& item : respJson["items"]) {
+        // items 中每个元素形如 {"index": {...}} 或 {"delete": {...}}
+        const auto& opResult = item.begin().value();
+        DocResult docResult;
+        docResult.id = opResult.value("_id", "");
+        docResult.index = opResult.value("_index", "");
+        docResult.result = opResult.value("result", "");
+        docResult.version = opResult.value("_version", 0);
+        docResult.success = opResult.value("status", 500) < 300;
+
+        if (docResult.success) {
+            result.successCount++;
+        } else {
+            result.failCount++;
+        }
+        result.items.push_back(docResult);
+    }
+
+    return result;
+}
+
+bool ESClient::updateAliases(const json& actions) {
+    auto response = httpClient_.post(buildUrl("/_aliases"), actions.dump());
+    if (!response.isSuccess()) {
+        throw ESException("Alias update failed: " + response.body);
+    }
+    return true;
+}
+
+std::map<std::string, std::vector<std::string>> ESClient::getAliases(
+        const std::string& aliasNames) {
+    std::string path = "/_alias";
+    if (!aliasNames.empty()) {
+        path += "/" + aliasNames;
+    }
+
+    std::map<std::string, std::vector<std::string>> result;
+    auto response = httpClient_.get(buildUrl(path));
+
+    // 别名不存在时 ES 返回 404，视为空结果
+    if (response.isNotFound()) {
+        return result;
+    }
+    if (!response.isSuccess()) {
+        throw ESException("Failed to get aliases: " + response.body);
+    }
+
+    auto respJson = json::parse(response.body);
+    // 响应结构：{ "<index>": { "aliases": { "<alias>": {} } } }
+    for (auto it = respJson.begin(); it != respJson.end(); ++it) {
+        const std::string& physicalIndex = it.key();
+        const auto& aliases = it.value().value("aliases", json::object());
+        for (auto ait = aliases.begin(); ait != aliases.end(); ++ait) {
+            result[ait.key()].push_back(physicalIndex);
+        }
+    }
+    return result;
+}
+
+std::string ESClient::resolveAlias(const std::string& aliasName) {
+    auto all = getAliases(aliasName);
+    auto it = all.find(aliasName);
+    if (it == all.end() || it->second.size() != 1) {
+        return "";
+    }
+    return it->second.front();
+}
+
+bool ESClient::setIndexWriteBlock(const std::string& indexName, bool blocked) {
+    json body = {{"index", {{"blocks.write", blocked}}}};
+    auto response = httpClient_.put(
+        buildUrl("/" + indexName + "/_settings"), body.dump());
+    if (!response.isSuccess()) {
+        throw ESException("Failed to set write block on '" + indexName +
+                          "': " + response.body);
+    }
+    return true;
+}
+
+long ESClient::documentCount(const std::string& indexName) {
+    auto response = httpClient_.get(buildUrl("/" + indexName + "/_count"));
+    if (!response.isSuccess()) {
+        throw ESException("Failed to get document count: " + response.body);
+    }
+    return json::parse(response.body).value("count", 0L);
+}
+
+json ESClient::getMapping(const std::string& indexName) {
+    auto response = httpClient_.get(buildUrl("/" + indexName + "/_mapping"));
+    if (!response.isSuccess()) {
+        throw ESException("Failed to get mapping: " + response.body);
+    }
+    auto respJson = json::parse(response.body);
+    // { "<index>": { "mappings": {...} } }
+    auto it = respJson.begin();
+    if (it == respJson.end()) {
+        return json::object();
+    }
+    return it.value().value("mappings", json::object());
+}
+
+HttpResponse ESClient::rawRequest(const std::string& method,
+                                  const std::string& path,
+                                  const std::string& body) {
+    const std::string url = buildUrl(path);
+    if (method == "GET") {
+        return httpClient_.get(url);
+    }
+    if (method == "POST") {
+        return httpClient_.post(url, body);
+    }
+    if (method == "PUT") {
+        return httpClient_.put(url, body);
+    }
+    if (method == "DELETE") {
+        if (!body.empty()) {
+            return httpClient_.del(url,
+                {{"Content-Type", "application/json"}}, body);
+        }
+        return httpClient_.del(url);
+    }
+    throw ESException("Unsupported HTTP method: " + method);
 }
 
 // ==================== 搜索操作 ====================

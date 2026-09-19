@@ -5,6 +5,7 @@
 #include "json.hpp"
 #include <string>
 #include <vector>
+#include <map>
 #include <optional>
 #include <functional>
 
@@ -77,6 +78,11 @@ public:
      */
     explicit ESClient(const std::string& host = "localhost", int port = 9200);
     ~ESClient();
+
+    /**
+     * 派生一个独立连接的客户端（各自持有 libcurl handle，可在不同线程使用）
+     */
+    std::unique_ptr<ESClient> fork() const;
     
     // ==================== 集群操作 ====================
     
@@ -164,6 +170,67 @@ public:
     BulkResult bulkIndex(const std::string& indexName,
                          const std::vector<json>& docs,
                          const std::vector<std::string>& ids = {});
+
+    // ==================== 别名与迁移相关操作 ====================
+
+    /**
+     * 批量操作中的单条动作
+     * op 取值："index"（写文档）或 "delete"（删文档）
+     */
+    struct BulkAction {
+        std::string op;
+        std::string index;
+        std::string id;
+        json doc;
+    };
+
+    /**
+     * 混合批量操作（同一批中可包含 index / delete）
+     * 用于迁移复制时把旧索引的删除同步到新索引
+     */
+    BulkResult bulkActions(const std::vector<BulkAction>& actions);
+
+    /**
+     * 原子别名操作：一次性提交多组 add/remove，Elasticsearch 保证整体原子生效
+     * @param actions 形如 {"actions":[{"add":{...}},{"remove":{...}}]}
+     */
+    bool updateAliases(const json& actions);
+
+    /**
+     * 查询别名指向的物理索引
+     * @return alias 名称 -> 物理索引名列表（正常情况下写别名应只有一个元素）
+     */
+    std::map<std::string, std::vector<std::string>> getAliases(
+            const std::string& aliasNames = "");
+
+    /**
+     * 解析单个别名当前指向的物理索引；不存在或指向多个索引时返回空串
+     */
+    std::string resolveAlias(const std::string& aliasName);
+
+    /**
+     * 设置/解除索引只读写阻塞（迁移终同步期间冻结写入）
+     */
+    bool setIndexWriteBlock(const std::string& indexName, bool blocked);
+
+    /**
+     * 获取索引文档数量
+     */
+    long documentCount(const std::string& indexName);
+
+    /**
+     * 获取索引 mapping（返回该索引下的 mappings 对象）
+     */
+    json getMapping(const std::string& indexName);
+
+    /**
+     * 透传底层 HTTP 请求，供迁移状态机调用 scroll / _pit / _count 等接口
+     * @param method GET / POST / PUT / DELETE
+     * @param path 以 / 开头的路径（可带 query string）
+     */
+    HttpResponse rawRequest(const std::string& method,
+                            const std::string& path,
+                            const std::string& body = "");
     
     // ==================== 搜索操作 ====================
     
@@ -229,8 +296,15 @@ public:
      */
     void setLogCallback(LogCallback callback);
 
+    /**
+     * 输出一条日志（走已设置的日志回调）
+     */
+    void emitLog(const std::string& message) { log(message); }
+
 private:
     std::string baseUrl_;
+    std::string host_;
+    int port_ = 9200;
     HttpClient httpClient_;
     LogCallback logCallback_;
     

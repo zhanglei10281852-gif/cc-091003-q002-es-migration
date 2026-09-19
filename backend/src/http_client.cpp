@@ -209,13 +209,18 @@ HttpResponse HttpClient::put(const std::string& url,
 }
 
 HttpResponse HttpClient::del(const std::string& url,
-                             const std::map<std::string, std::string>& headers) {
+                             const std::map<std::string, std::string>& headers,
+                             const std::string& body) {
     HttpResponse response;
     std::string responseBody;
-    
+
     curl_easy_reset(pImpl->curl);
     curl_easy_setopt(pImpl->curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(pImpl->curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    if (!body.empty()) {
+        curl_easy_setopt(pImpl->curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(pImpl->curl, CURLOPT_POSTFIELDSIZE, body.size());
+    }
     curl_easy_setopt(pImpl->curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(pImpl->curl, CURLOPT_WRITEDATA, &responseBody);
     curl_easy_setopt(pImpl->curl, CURLOPT_HEADERFUNCTION, HeaderCallback);

@@ -18,14 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 设置工作目录
 WORKDIR /app
 
-# 下载 nlohmann/json 头文件
-RUN mkdir -p include && \
-    curl -sL https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp -o include/json.hpp
-
-# 复制源代码
+# 复制源代码（nlohmann/json 头文件已随仓库提供：include/json.hpp）
 COPY CMakeLists.txt .
 COPY include/http_client.hpp include/
 COPY include/es_client.hpp include/
+COPY include/migration.hpp include/
+COPY include/json.hpp include/
 COPY src/ src/
 COPY data/ data/
 

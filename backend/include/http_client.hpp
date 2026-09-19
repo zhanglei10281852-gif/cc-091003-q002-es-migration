@@ -82,10 +82,11 @@ public:
                      const std::map<std::string, std::string>& headers = {});
     
     /**
-     * DELETE 请求
+     * DELETE 请求（可带请求体，用于清理 scroll 上下文等）
      */
     HttpResponse del(const std::string& url,
-                     const std::map<std::string, std::string>& headers = {});
+                     const std::map<std::string, std::string>& headers = {},
+                     const std::string& body = "");
     
     /**
      * HEAD 请求
