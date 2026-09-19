@@ -33,6 +33,36 @@ void ESClient::setLogCallback(LogCallback callback) {
     logCallback_ = std::move(callback);
 }
 
+bool ESClient::shouldMirror(const std::string& indexName) const {
+    return !mirrorAlias_.empty() &&
+           indexName == mirrorAlias_ &&
+           indexName != mirrorIndex_;
+}
+
+// ==================== 双写镜像 ====================
+
+void ESClient::setWriteMirror(const std::string& aliasName, const std::string& mirrorIndex) {
+    mirrorAlias_ = aliasName;
+    mirrorIndex_ = mirrorIndex;
+    log("双写镜像已开启: " + aliasName + " -> " + mirrorIndex);
+}
+
+void ESClient::clearWriteMirror() {
+    if (!mirrorAlias_.empty()) {
+        log("双写镜像已关闭");
+    }
+    mirrorAlias_.clear();
+    mirrorIndex_.clear();
+}
+
+bool ESClient::hasWriteMirror() const {
+    return !mirrorAlias_.empty();
+}
+
+std::string ESClient::writeMirrorIndex() const {
+    return mirrorIndex_;
+}
+
 // ==================== 集群操作 ====================
 
 bool ESClient::ping() {
@@ -116,18 +146,126 @@ bool ESClient::refreshIndex(const std::string& indexName) {
     return response.isSuccess();
 }
 
+std::vector<std::string> ESClient::listIndices(const std::string& pattern) {
+    auto response = httpClient_.get(buildUrl("/_cat/indices/" + pattern + "?format=json&h=index"));
+    if (!response.isSuccess()) {
+        throw ESException("Failed to list indices: " + response.body);
+    }
+    std::vector<std::string> indices;
+    for (const auto& item : json::parse(response.body)) {
+        indices.push_back(item.value("index", ""));
+    }
+    return indices;
+}
+
+long ESClient::countDocuments(const std::string& indexName) {
+    auto response = httpClient_.get(buildUrl("/" + indexName + "/_count"));
+    if (!response.isSuccess()) {
+        throw ESException("Failed to count documents: " + response.body);
+    }
+    return json::parse(response.body).value("count", 0L);
+}
+
+// ==================== 别名操作 ====================
+
+bool ESClient::aliasExists(const std::string& aliasName) {
+    auto response = httpClient_.head(buildUrl("/_alias/" + aliasName));
+    return response.isSuccess();
+}
+
+std::vector<std::string> ESClient::getAliasIndices(const std::string& aliasName) {
+    auto response = httpClient_.get(buildUrl("/_alias/" + aliasName));
+    if (response.isNotFound()) {
+        return {};
+    }
+    if (!response.isSuccess()) {
+        throw ESException("Failed to get alias: " + response.body);
+    }
+    std::vector<std::string> indices;
+    const auto body = json::parse(response.body);
+    for (const auto& [indexName, _] : body.items()) {
+        indices.push_back(indexName);
+    }
+    return indices;
+}
+
+std::vector<std::string> ESClient::getIndexAliases(const std::string& indexName) {
+    auto response = httpClient_.get(buildUrl("/" + indexName + "/_alias"));
+    if (response.isNotFound()) {
+        return {};
+    }
+    if (!response.isSuccess()) {
+        throw ESException("Failed to get index aliases: " + response.body);
+    }
+    std::vector<std::string> aliases;
+    auto body = json::parse(response.body);
+    if (body.contains(indexName) && body[indexName].contains("aliases")) {
+        for (const auto& [aliasName, _] : body[indexName]["aliases"].items()) {
+            aliases.push_back(aliasName);
+        }
+    }
+    return aliases;
+}
+
+bool ESClient::updateAliases(const json& actions) {
+    json body = {{"actions", actions}};
+    log("Updating aliases: " + actions.dump());
+    auto response = httpClient_.post(buildUrl("/_aliases"), body.dump());
+    if (!response.isSuccess()) {
+        throw ESException("Failed to update aliases: " + response.body);
+    }
+    return true;
+}
+
+// ==================== 异步复制（Reindex） ====================
+
+std::string ESClient::reindexAsync(const std::string& sourceIndex,
+                                   const std::string& destIndex,
+                                   const std::string& opType,
+                                   const std::string& conflicts) {
+    json body = {
+        {"source", {{"index", sourceIndex}}},
+        {"dest", {{"index", destIndex}, {"op_type", opType}}},
+        {"conflicts", conflicts}
+    };
+    log("Starting async reindex: " + sourceIndex + " -> " + destIndex);
+    auto response = httpClient_.post(
+        buildUrl("/_reindex?wait_for_completion=false"), body.dump());
+    if (!response.isSuccess()) {
+        throw ESException("Failed to start reindex: " + response.body);
+    }
+    std::string taskId = json::parse(response.body).value("task", "");
+    log("Reindex task started: " + taskId);
+    return taskId;
+}
+
+std::optional<json> ESClient::getTask(const std::string& taskId) {
+    auto response = httpClient_.get(buildUrl("/_tasks/" + taskId));
+    if (response.isNotFound()) {
+        return std::nullopt;
+    }
+    if (!response.isSuccess()) {
+        throw ESException("Failed to get task: " + response.body);
+    }
+    return json::parse(response.body);
+}
+
 // ==================== 文档操作 ====================
 
 DocResult ESClient::indexDocument(const std::string& indexName,
                                   const json& doc,
-                                  const std::string& id) {
+                                  const std::string& id,
+                                  bool refresh) {
     std::string url = "/" + indexName + "/_doc";
     if (!id.empty()) {
         url += "/" + id;
     }
-    
+    if (refresh) {
+        url += "?refresh=true";
+    }
+
     auto response = httpClient_.post(buildUrl(url), doc.dump());
-    
+
     DocResult result;
     if (response.isSuccess()) {
         auto respJson = json::parse(response.body);
@@ -141,7 +279,13 @@ DocResult ESClient::indexDocument(const std::string& indexName,
         result.success = false;
         throw ESException("Failed to index document: " + response.body);
     }
-    
+
+    // 双写镜像：经写别名的写入同步到迁移目标索引（沿用主索引返回的 ID，保证两侧一致）
+    if (shouldMirror(indexName)) {
+        log("Mirroring index to " + mirrorIndex_ + ": " + result.id);
+        indexDocument(mirrorIndex_, doc, result.id);
+    }
+
     return result;
 }
 
@@ -169,10 +313,10 @@ DocResult ESClient::updateDocument(const std::string& indexName,
                                    const json& doc) {
     json body = {{"doc", doc}};
     auto response = httpClient_.post(
-        buildUrl("/" + indexName + "/_update/" + id), 
+        buildUrl("/" + indexName + "/_update/" + id),
         body.dump()
     );
-    
+
     DocResult result;
     if (response.isSuccess()) {
         auto respJson = json::parse(response.body);
@@ -186,24 +330,41 @@ DocResult ESClient::updateDocument(const std::string& indexName,
         result.success = false;
         throw ESException("Failed to update document: " + response.body);
     }
-    
+
+    // 双写镜像：回读主索引最新完整文档后整体写入镜像，
+    // 避免镜像侧只拿到部分字段（upsert 半文档）导致数据不完整
+    if (shouldMirror(indexName)) {
+        log("Mirroring update to " + mirrorIndex_ + ": " + id);
+        auto latest = getDocument(indexName, id);
+        if (latest) {
+            indexDocument(mirrorIndex_, *latest, id);
+        }
+    }
+
     return result;
 }
 
 bool ESClient::deleteDocument(const std::string& indexName,
                               const std::string& id) {
     auto response = httpClient_.del(buildUrl("/" + indexName + "/_doc/" + id));
-    
+
+    bool deleted = false;
     if (response.isSuccess()) {
         log("Document deleted: " + id);
-        return true;
+        deleted = true;
+    } else if (response.isNotFound()) {
+        deleted = false;
+    } else {
+        throw ESException("Failed to delete document: " + response.body);
     }
-    
-    if (response.isNotFound()) {
-        return false;
+
+    // 双写镜像：删除同步到迁移目标索引（目标上不存在则忽略）
+    if (deleted && shouldMirror(indexName)) {
+        log("Mirroring delete to " + mirrorIndex_ + ": " + id);
+        deleteDocument(mirrorIndex_, id);
     }
-    
-    throw ESException("Failed to delete document: " + response.body);
+
+    return deleted;
 }
 
 BulkResult ESClient::bulkIndex(const std::string& indexName,
@@ -251,7 +412,26 @@ BulkResult ESClient::bulkIndex(const std::string& indexName,
     } else {
         throw ESException("Bulk index failed: " + response.body);
     }
-    
+
+    // 双写镜像：把主索引上成功的条目同步到迁移目标索引（自动生成的 ID 以主索引返回为准）
+    if (shouldMirror(indexName) && result.successCount > 0) {
+        std::vector<json> mirrorDocs;
+        std::vector<std::string> mirrorIds;
+        for (size_t i = 0; i < docs.size(); ++i) {
+            if (i < result.items.size() && result.items[i].success) {
+                mirrorDocs.push_back(docs[i]);
+                std::string id = (i < ids.size() && !ids[i].empty())
+                                     ? ids[i] : result.items[i].id;
+                mirrorIds.push_back(id);
+            }
+        }
+        if (!mirrorDocs.empty()) {
+            log("Mirroring bulk of " + std::to_string(mirrorDocs.size()) +
+                " docs to " + mirrorIndex_);
+            bulkIndex(mirrorIndex_, mirrorDocs, mirrorIds);
+        }
+    }
+
     return result;
 }
 

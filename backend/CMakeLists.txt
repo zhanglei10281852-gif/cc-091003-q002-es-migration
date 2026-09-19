@@ -41,6 +41,7 @@ set(SOURCES
     src/main.cpp
     src/http_client.cpp
     src/es_client.cpp
+    src/migration_manager.cpp
 )
 
 # 可执行文件

@@ -26,6 +26,7 @@ RUN mkdir -p include && \
 COPY CMakeLists.txt .
 COPY include/http_client.hpp include/
 COPY include/es_client.hpp include/
+COPY include/migration_manager.hpp include/
 COPY src/ src/
 COPY data/ data/
 

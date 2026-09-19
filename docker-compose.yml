@@ -46,6 +46,9 @@ services:
     environment:
       - ES_HOST=elasticsearch
       - ES_PORT=9200
+    # 默认运行迁移集成场景；可覆盖为 demo / migrate / status 等命令
+    # 例如: docker-compose run --rm cpp-demo ./es_demo status
+    command: ["./es_demo", "scenario"]
     networks:
       - es-network
     depends_on:
